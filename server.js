@@ -22,7 +22,7 @@ const app = express();
 
 app.use(cors());
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 
 
@@ -32,7 +32,7 @@ if (!fs.existsSync(TMP)) fs.mkdirSync(TMP);
 
 
 
-// ===== تأكد إن ffmpeg و yt-dlp موجودين =====
+// ===== Dependencies Check =====
 
 const checkDeps = () => {
 
@@ -58,7 +58,7 @@ const checkDeps = () => {
 
 
 
-// ===== Gameplay Videos (موجودة على السيرفر) =====
+// ===== Gameplay Videos =====
 
 const GAMEPLAY_VIDEOS = {
 
@@ -78,23 +78,71 @@ const GAMEPLAY_VIDEOS = {
 
 app.get('/', (req, res) => {
 
-  res.json({ status: '✅ Double Y Server شغال!', version: '1.0.0' });
+  res.json({ status: '✅ Double Y Server شغال!', version: '2.0.0' });
 
 });
 
 
 
-// ===== تحميل TikTok فيديو =====
+// ===== جيب ترند من TikTok/YouTube Shorts =====
 
-const downloadTikTok = (url, outputPath) => {
+const fetchTrendingVideo = (region) => {
 
   return new Promise((resolve, reject) => {
 
-    exec(`yt-dlp -o "${outputPath}" --no-playlist -f "best[ext=mp4]/best" "${url}"`, (err, stdout, stderr) => {
+    const query = region === 'egypt' ? 'tiktok trending مصر' : 'tiktok trending USA';
 
-      if (err) reject(new Error('فشل تحميل TikTok: ' + stderr));
+    const regionCode = region === 'egypt' ? 'EG' : 'US';
 
-      else resolve(outputPath);
+    // yt-dlp يبحث ويجيب أول فيديو trending short
+
+    const cmd = `yt-dlp --no-download --print "%(webpage_url)s|||%(title)s|||%(duration)s" "ytsearch10:${query} shorts" --match-filter "duration<61" --max-downloads 5 2>/dev/null | head -5`;
+
+    
+
+    exec(cmd, { timeout: 30000 }, (err, stdout, stderr) => {
+
+      if (err || !stdout.trim()) {
+
+        // Fallback: ابحث بطريقة تانية
+
+        const fallbackCmd = `yt-dlp --no-download --print "%(webpage_url)s|||%(title)s|||%(duration)s" "ytsearch5:trending shorts ${regionCode} 2024" --match-filter "duration<61" --max-downloads 3 2>/dev/null | head -3`;
+
+        exec(fallbackCmd, { timeout: 30000 }, (err2, stdout2) => {
+
+          if (err2 || !stdout2.trim()) {
+
+            reject(new Error('مش لاقي فيديوهات trending'));
+
+            return;
+
+          }
+
+          const lines = stdout2.trim().split('\n').filter(l => l.includes('|||'));
+
+          if (!lines.length) { reject(new Error('مش لاقي فيديوهات')); return; }
+
+          const random = lines[Math.floor(Math.random() * lines.length)];
+
+          const [url, title, duration] = random.split('|||');
+
+          resolve({ url: url.trim(), title: title.trim(), duration: parseInt(duration) || 30 });
+
+        });
+
+        return;
+
+      }
+
+      const lines = stdout.trim().split('\n').filter(l => l.includes('|||'));
+
+      if (!lines.length) { reject(new Error('مش لاقي فيديوهات')); return; }
+
+      const random = lines[Math.floor(Math.random() * lines.length)];
+
+      const [url, title, duration] = random.split('|||');
+
+      resolve({ url: url.trim(), title: title.trim(), duration: parseInt(duration) || 30 });
 
     });
 
@@ -104,23 +152,25 @@ const downloadTikTok = (url, outputPath) => {
 
 
 
-// ===== تحميل Gameplay فيديو =====
+// ===== تحميل فيديو =====
 
-const downloadGameplay = async (type, outputPath) => {
-
-  const url = GAMEPLAY_VIDEOS[type] || GAMEPLAY_VIDEOS.default;
-
-  const response = await axios({ url, method: 'GET', responseType: 'stream' });
+const downloadVideo = (url, outputPath) => {
 
   return new Promise((resolve, reject) => {
 
-    const writer = fs.createWriteStream(outputPath);
+    exec(`yt-dlp -o "${outputPath}" --no-playlist -f "best[ext=mp4]/best" --max-filesize 50M "${url}"`, 
 
-    response.data.pipe(writer);
+      { timeout: 60000 }, 
 
-    writer.on('finish', () => resolve(outputPath));
+      (err, stdout, stderr) => {
 
-    writer.on('error', reject);
+        if (err) reject(new Error('فشل التحميل'));
+
+        else if (fs.existsSync(outputPath)) resolve(outputPath);
+
+        else reject(new Error('الملف مش موجود بعد التحميل'));
+
+    });
 
   });
 
@@ -128,11 +178,57 @@ const downloadGameplay = async (type, outputPath) => {
 
 
 
+// ===== تحميل Gameplay من Google Drive =====
+
+const downloadGameplay = async (type, outputPath) => {
+
+  const url = GAMEPLAY_VIDEOS[type] || GAMEPLAY_VIDEOS.default;
+
+  try {
+
+    const response = await axios({ url, method: 'GET', responseType: 'stream', maxRedirects: 5, timeout: 30000 });
+
+    return new Promise((resolve, reject) => {
+
+      const writer = fs.createWriteStream(outputPath);
+
+      response.data.pipe(writer);
+
+      writer.on('finish', () => resolve(outputPath));
+
+      writer.on('error', reject);
+
+    });
+
+  } catch (e) {
+
+    // Google Drive ممكن يعمل redirect — جرب بـ confirm
+
+    const confirmUrl = url + '&confirm=t';
+
+    const response = await axios({ url: confirmUrl, method: 'GET', responseType: 'stream', maxRedirects: 5, timeout: 30000 });
+
+    return new Promise((resolve, reject) => {
+
+      const writer = fs.createWriteStream(outputPath);
+
+      response.data.pipe(writer);
+
+      writer.on('finish', () => resolve(outputPath));
+
+      writer.on('error', reject);
+
+    });
+
+  }
+
+};
+
+
+
 // ===== دمج الفيديوهات =====
 
-// TikTok فوق (70% من الشاشة) + Gameplay تحت (30%)
-
-const mergeVideos = (tiktokPath, gameplayPath, outputPath) => {
+const mergeVideos = (tiktokPath, gameplayPath, outputPath, duration = 30) => {
 
   return new Promise((resolve, reject) => {
 
@@ -144,21 +240,11 @@ const mergeVideos = (tiktokPath, gameplayPath, outputPath) => {
 
       .complexFilter([
 
-        // scale TikTok to 1080x1344 (70% of 1920)
+        '[0:v]scale=1080:1344:force_original_aspect_ratio=decrease,pad=1080:1344:(ow-iw)/2:(oh-ih)/2,setsar=1[top]',
 
-        '[0:v]scale=1080:1344,setsar=1[top]',
+        '[1:v]scale=1080:576:force_original_aspect_ratio=decrease,pad=1080:576:(ow-iw)/2:(oh-ih)/2,setsar=1[bottom]',
 
-        // scale gameplay to 1080x576 (30% of 1920)
-
-        '[1:v]scale=1080:576,setsar=1[bottom]',
-
-        // stack vertically
-
-        '[top][bottom]vstack=inputs=2[out]',
-
-        // audio from TikTok only
-
-        '[0:a]aformat=sample_rates=44100[audio]'
+        '[top][bottom]vstack=inputs=2[out]'
 
       ])
 
@@ -166,19 +252,23 @@ const mergeVideos = (tiktokPath, gameplayPath, outputPath) => {
 
         '-map [out]',
 
-        '-map [audio]',
+        '-map 0:a?',
 
-        '-t 30',           // 30 ثانية بس
+        `-t ${Math.min(duration, 59)}`,
 
         '-c:v libx264',
 
+        '-preset fast',
+
         '-c:a aac',
 
-        '-b:v 2000k',
+        '-b:v 2500k',
 
         '-b:a 128k',
 
         '-r 30',
+
+        '-movflags +faststart',
 
         '-shortest',
 
@@ -200,19 +290,11 @@ const mergeVideos = (tiktokPath, gameplayPath, outputPath) => {
 
 
 
-// ===== الـ API الرئيسي: إنشاء فيديو =====
+// ===== API: إنشاء فيديو كامل (ترند + دمج) =====
 
 app.post('/create-video', async (req, res) => {
 
-  const { tiktokUrl, gameplayType = 'minecraft' } = req.body;
-
-
-
-  if (!tiktokUrl) {
-
-    return res.status(400).json({ error: 'محتاج tiktokUrl' });
-
-  }
+  const { tiktokUrl, gameplayType = 'minecraft', region = 'egypt' } = req.body;
 
 
 
@@ -224,65 +306,93 @@ app.post('/create-video', async (req, res) => {
 
   const outputPath = path.join(TMP, `${id}_output.mp4`);
 
+  const cleanup = () => [tiktokPath, gameplayPath, outputPath].forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch(e) {} });
 
 
-  console.log(`🎬 بدأ إنشاء فيديو: ${id}`);
+
+  console.log(`🎬 [${id}] بدأ إنشاء فيديو...`);
 
 
 
   try {
 
-    // 1. حمّل TikTok
+    let videoUrl = tiktokUrl;
 
-    console.log('⬇️ جاري تحميل TikTok...');
-
-    await downloadTikTok(tiktokUrl, tiktokPath);
+    let trendTitle = '';
 
 
 
-    // 2. حمّل Gameplay
+    // 1. لو مفيش URL — جيب ترند أوتوماتيك
 
-    console.log('⬇️ جاري تحميل Gameplay...');
+    if (!videoUrl) {
+
+      console.log(`🔍 [${id}] جاري البحث عن ترند...`);
+
+      const trend = await fetchTrendingVideo(region);
+
+      videoUrl = trend.url;
+
+      trendTitle = trend.title;
+
+      console.log(`✅ [${id}] لقينا: ${trendTitle}`);
+
+    }
+
+
+
+    // 2. حمّل الفيديو
+
+    console.log(`⬇️ [${id}] جاري تحميل الفيديو...`);
+
+    await downloadVideo(videoUrl, tiktokPath);
+
+
+
+    // 3. حمّل Gameplay
+
+    console.log(`⬇️ [${id}] جاري تحميل Gameplay (${gameplayType})...`);
 
     await downloadGameplay(gameplayType, gameplayPath);
 
 
 
-    // 3. ادمج الفيديوهات
+    // 4. ادمج
 
-    console.log('🎞️ جاري الدمج...');
+    console.log(`🎞️ [${id}] جاري الدمج...`);
 
     await mergeVideos(tiktokPath, gameplayPath, outputPath);
 
 
 
-    // 4. ابعت الفيديو
+    // 5. حول لـ base64 وابعته
 
-    console.log('✅ تم! جاري الإرسال...');
+    console.log(`📤 [${id}] جاري الإرسال...`);
 
-    res.setHeader('Content-Type', 'video/mp4');
+    const videoBuffer = fs.readFileSync(outputPath);
 
-    res.setHeader('Content-Disposition', `attachment; filename="doubley_${id}.mp4"`);
+    const base64Video = videoBuffer.toString('base64');
 
-
-
-    const stream = fs.createReadStream(outputPath);
-
-    stream.pipe(res);
+    const fileSizeMB = (videoBuffer.length / 1024 / 1024).toFixed(2);
 
 
 
-    stream.on('end', () => {
+    cleanup();
 
-      // امسح الملفات المؤقتة
+    console.log(`✅ [${id}] تم! (${fileSizeMB} MB)`);
 
-      [tiktokPath, gameplayPath, outputPath].forEach(f => {
 
-        if (fs.existsSync(f)) fs.unlinkSync(f);
 
-      });
+    res.json({
 
-      console.log(`🗑️ تم مسح الملفات المؤقتة: ${id}`);
+      success: true,
+
+      video: base64Video,
+
+      trendTitle: trendTitle,
+
+      fileSize: fileSizeMB,
+
+      mimeType: 'video/mp4',
 
     });
 
@@ -290,17 +400,11 @@ app.post('/create-video', async (req, res) => {
 
   } catch (err) {
 
-    console.error('❌ خطأ:', err.message);
+    console.error(`❌ [${id}] خطأ:`, err.message);
 
-    // امسح الملفات لو فيه خطأ
+    cleanup();
 
-    [tiktokPath, gameplayPath, outputPath].forEach(f => {
-
-      if (fs.existsSync(f)) fs.unlinkSync(f);
-
-    });
-
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ success: false, error: err.message });
 
   }
 
@@ -308,7 +412,29 @@ app.post('/create-video', async (req, res) => {
 
 
 
-// ===== Gameplay Types المتاحة =====
+// ===== API: جيب ترند بس بدون دمج =====
+
+app.post('/fetch-trend', async (req, res) => {
+
+  const { region = 'egypt' } = req.body;
+
+  try {
+
+    const trend = await fetchTrendingVideo(region);
+
+    res.json({ success: true, ...trend });
+
+  } catch (err) {
+
+    res.status(500).json({ success: false, error: err.message });
+
+  }
+
+});
+
+
+
+// ===== Gameplay Types =====
 
 app.get('/gameplay-types', (req, res) => {
 
@@ -332,13 +458,13 @@ app.get('/gameplay-types', (req, res) => {
 
 
 
-// ===== تشغيل السيرفر =====
+// ===== Start =====
 
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
 
-  console.log(`🚀 Double Y Server شغال على port ${PORT}`);
+  console.log(`🚀 Double Y Server v2.0 شغال على port ${PORT}`);
 
   checkDeps();
 
