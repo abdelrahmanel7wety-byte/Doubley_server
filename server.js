@@ -38,59 +38,128 @@ const GAMEPLAY_VIDEOS = {
 
 // ===== Health Check =====
 app.get('/', (req, res) => {
-  res.json({ status: '✅ Double Y Server شغال!', version: '2.0.0' });
+  res.json({ status: '✅ Double Y Server شغال!', version: '3.0.0' });
 });
 
-// ===== جيب ترند من TikTok/YouTube Shorts =====
-const fetchTrendingVideo = (region) => {
-  return new Promise((resolve, reject) => {
-    const query = region === 'egypt' ? 'tiktok trending مصر' : 'tiktok trending USA';
-    const regionCode = region === 'egypt' ? 'EG' : 'US';
-    // yt-dlp يبحث ويجيب أول فيديو trending short
-    const cmd = `yt-dlp --no-download --print "%(webpage_url)s|||%(title)s|||%(duration)s" "ytsearch10:${query} shorts" --match-filter "duration<61" --max-downloads 5 2>/dev/null | head -5`;
-    
-    exec(cmd, { timeout: 30000 }, (err, stdout, stderr) => {
-      if (err || !stdout.trim()) {
-        // Fallback: ابحث بطريقة تانية
-        const fallbackCmd = `yt-dlp --no-download --print "%(webpage_url)s|||%(title)s|||%(duration)s" "ytsearch5:trending shorts ${regionCode} 2024" --match-filter "duration<61" --max-downloads 3 2>/dev/null | head -3`;
-        exec(fallbackCmd, { timeout: 30000 }, (err2, stdout2) => {
-          if (err2 || !stdout2.trim()) {
-            reject(new Error('مش لاقي فيديوهات trending'));
-            return;
-          }
-          const lines = stdout2.trim().split('\n').filter(l => l.includes('|||'));
-          if (!lines.length) { reject(new Error('مش لاقي فيديوهات')); return; }
-          const random = lines[Math.floor(Math.random() * lines.length)];
-          const [url, title, duration] = random.split('|||');
-          resolve({ url: url.trim(), title: title.trim(), duration: parseInt(duration) || 30 });
-        });
-        return;
+// ===== جيب ترند من TikTok =====
+const fetchTrendingVideo = async (region) => {
+  const regionCode = region === 'egypt' ? 'EG' : 'US';
+  const regions = [regionCode, 'US', 'GB', 'SA'];
+
+  for (const rc of regions) {
+    try {
+      console.log(`🔍 جاري البحث في TikTok (${rc})...`);
+      const res = await axios.get(`https://www.tikwm.com/api/feed/list?region=${rc}&count=30`, {
+        timeout: 15000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json',
+        }
+      });
+
+      if (res.data?.data?.videos?.length) {
+        const videos = res.data.data.videos.filter(v =>
+          v.duration >= 10 && v.duration <= 60 && v.play
+        );
+
+        if (videos.length) {
+          const pick = videos[Math.floor(Math.random() * videos.length)];
+          console.log(`✅ لقينا ترند: ${pick.title || 'TikTok'} (${pick.duration}s)`);
+          return {
+            url: `https://www.tiktok.com/@${pick.author?.unique_id || 'user'}/video/${pick.video_id}`,
+            title: pick.title || 'TikTok Trend',
+            duration: pick.duration || 30,
+            downloadUrl: pick.play,
+          };
+        }
       }
-      const lines = stdout.trim().split('\n').filter(l => l.includes('|||'));
-      if (!lines.length) { reject(new Error('مش لاقي فيديوهات')); return; }
-      const random = lines[Math.floor(Math.random() * lines.length)];
-      const [url, title, duration] = random.split('|||');
-      resolve({ url: url.trim(), title: title.trim(), duration: parseInt(duration) || 30 });
+    } catch (e) {
+      console.log(`⚠️ فشل البحث في ${rc}: ${e.message}`);
+      continue;
+    }
+  }
+
+  // Fallback: tikwm search
+  try {
+    console.log('🔍 Fallback: tikwm search...');
+    const searchRes = await axios.get(`https://www.tikwm.com/api/feed/search?keywords=trending&count=20&region=${regionCode}`, {
+      timeout: 15000,
+      headers: { 'User-Agent': 'Mozilla/5.0' }
     });
-  });
+
+    if (searchRes.data?.data?.videos?.length) {
+      const videos = searchRes.data.data.videos.filter(v => v.duration >= 10 && v.duration <= 60 && v.play);
+      if (videos.length) {
+        const pick = videos[Math.floor(Math.random() * videos.length)];
+        return {
+          url: `https://www.tiktok.com/@${pick.author?.unique_id || 'user'}/video/${pick.video_id}`,
+          title: pick.title || 'TikTok Trend',
+          duration: pick.duration || 30,
+          downloadUrl: pick.play,
+        };
+      }
+    }
+  } catch (e) {
+    console.log('⚠️ Fallback search failed:', e.message);
+  }
+
+  throw new Error('مش لاقي فيديوهات trending — جرب تاني');
 };
 
 // ===== تحميل فيديو =====
-const downloadVideo = (url, outputPath) => {
+const downloadVideo = async (url, outputPath, directUrl = null) => {
+  // لو فيه رابط مباشر من tikwm — حمّل مباشرة (أسرع وأضمن)
+  if (directUrl) {
+    try {
+      console.log('⬇️ تحميل مباشر من tikwm...');
+      const response = await axios({
+        url: directUrl,
+        method: 'GET',
+        responseType: 'stream',
+        timeout: 30000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://www.tiktok.com/',
+        }
+      });
+      return new Promise((resolve, reject) => {
+        const writer = fs.createWriteStream(outputPath);
+        response.data.pipe(writer);
+        writer.on('finish', () => {
+          const stats = fs.statSync(outputPath);
+          if (stats.size > 10000) {
+            console.log(`✅ تم التحميل المباشر (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
+            resolve(outputPath);
+          } else {
+            console.log('⚠️ الملف صغير أوي — هنجرب yt-dlp');
+            reject(new Error('ملف صغير'));
+          }
+        });
+        writer.on('error', reject);
+      });
+    } catch (e) {
+      console.log('⚠️ Direct download failed, trying yt-dlp...', e.message);
+    }
+  }
+
+  // Fallback: yt-dlp
   return new Promise((resolve, reject) => {
-    exec(`yt-dlp -o "${outputPath}" --no-playlist -f "best[ext=mp4]/best" --max-filesize 50M "${url}"`, 
-      { timeout: 60000 }, 
-      (err, stdout, stderr) => {
+    console.log('⬇️ تحميل بـ yt-dlp...');
+    exec(`yt-dlp -o "${outputPath}" --no-playlist -f "best[ext=mp4]/best" --max-filesize 50M "${url}"`,
+      { timeout: 60000 },
+      (err) => {
         if (err) reject(new Error('فشل التحميل'));
-        else if (fs.existsSync(outputPath)) resolve(outputPath);
-        else reject(new Error('الملف مش موجود بعد التحميل'));
-    });
+        else if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 10000) resolve(outputPath);
+        else reject(new Error('الملف مش موجود أو صغير أوي'));
+      });
   });
 };
 
 // ===== تحميل Gameplay من Google Drive =====
 const downloadGameplay = async (type, outputPath) => {
   const url = GAMEPLAY_VIDEOS[type] || GAMEPLAY_VIDEOS.default;
+  console.log(`⬇️ تحميل Gameplay (${type})...`);
+
   try {
     const response = await axios({ url, method: 'GET', responseType: 'stream', maxRedirects: 5, timeout: 30000 });
     return new Promise((resolve, reject) => {
@@ -100,7 +169,6 @@ const downloadGameplay = async (type, outputPath) => {
       writer.on('error', reject);
     });
   } catch (e) {
-    // Google Drive ممكن يعمل redirect — جرب بـ confirm
     const confirmUrl = url + '&confirm=t';
     const response = await axios({ url: confirmUrl, method: 'GET', responseType: 'stream', maxRedirects: 5, timeout: 30000 });
     return new Promise((resolve, reject) => {
@@ -115,6 +183,7 @@ const downloadGameplay = async (type, outputPath) => {
 // ===== دمج الفيديوهات =====
 const mergeVideos = (tiktokPath, gameplayPath, outputPath, duration = 30) => {
   return new Promise((resolve, reject) => {
+    console.log(`🎞️ دمج الفيديوهات (${duration}s)...`);
     ffmpeg()
       .input(tiktokPath)
       .input(gameplayPath)
@@ -138,11 +207,31 @@ const mergeVideos = (tiktokPath, gameplayPath, outputPath, duration = 30) => {
         '-y'
       ])
       .output(outputPath)
-      .on('end', () => resolve(outputPath))
+      .on('end', () => {
+        console.log('✅ تم الدمج');
+        resolve(outputPath);
+      })
       .on('error', (err) => reject(new Error('فشل الدمج: ' + err.message)))
       .run();
   });
 };
+
+// ===== نضافة tmp =====
+const cleanupOldFiles = () => {
+  try {
+    const files = fs.readdirSync(TMP);
+    const now = Date.now();
+    files.forEach(f => {
+      const fp = path.join(TMP, f);
+      const stats = fs.statSync(fp);
+      if (now - stats.mtimeMs > 10 * 60 * 1000) {
+        fs.unlinkSync(fp);
+      }
+    });
+  } catch (e) {}
+};
+
+setInterval(cleanupOldFiles, 5 * 60 * 1000);
 
 // ===== API: إنشاء فيديو كامل (ترند + دمج) =====
 app.post('/create-video', async (req, res) => {
@@ -154,24 +243,27 @@ app.post('/create-video', async (req, res) => {
   const outputPath = path.join(TMP, `${id}_output.mp4`);
   const cleanup = () => [tiktokPath, gameplayPath, outputPath].forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch(e) {} });
 
-  console.log(`🎬 [${id}] بدأ إنشاء فيديو...`);
+  console.log(`\n🎬 ========== [${id}] بدأ إنشاء فيديو ==========`);
+  console.log(`   Region: ${region} | Gameplay: ${gameplayType} | Custom URL: ${tiktokUrl ? 'yes' : 'no'}`);
 
   try {
     let videoUrl = tiktokUrl;
     let trendTitle = '';
+    let directDownloadUrl = null;
 
-    // 1. لو مفيش URL — جيب ترند أوتوماتيك
+    // 1. لو مفيش URL — جيب ترند أوتوماتيك من TikTok
     if (!videoUrl) {
-      console.log(`🔍 [${id}] جاري البحث عن ترند...`);
+      console.log(`🔍 [${id}] جاري البحث عن ترند TikTok...`);
       const trend = await fetchTrendingVideo(region);
       videoUrl = trend.url;
       trendTitle = trend.title;
+      directDownloadUrl = trend.downloadUrl;
       console.log(`✅ [${id}] لقينا: ${trendTitle}`);
     }
 
-    // 2. حمّل الفيديو
+    // 2. حمّل الفيديو (مباشر أو yt-dlp)
     console.log(`⬇️ [${id}] جاري تحميل الفيديو...`);
-    await downloadVideo(videoUrl, tiktokPath);
+    await downloadVideo(videoUrl, tiktokPath, directDownloadUrl);
 
     // 3. حمّل Gameplay
     console.log(`⬇️ [${id}] جاري تحميل Gameplay (${gameplayType})...`);
@@ -188,7 +280,8 @@ app.post('/create-video', async (req, res) => {
     const fileSizeMB = (videoBuffer.length / 1024 / 1024).toFixed(2);
 
     cleanup();
-    console.log(`✅ [${id}] تم! (${fileSizeMB} MB)`);
+    console.log(`✅ [${id}] تم بنجاح! (${fileSizeMB} MB)`);
+    console.log(`🎬 ========== [${id}] خلص ==========\n`);
 
     res.json({
       success: true,
@@ -231,7 +324,7 @@ app.get('/gameplay-types', (req, res) => {
 // ===== Start =====
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Double Y Server v2.0 شغال على port ${PORT}`);
+  console.log(`🚀 Double Y Server v3.0 شغال على port ${PORT}`);
   checkDeps();
+  cleanupOldFiles();
 });
-
